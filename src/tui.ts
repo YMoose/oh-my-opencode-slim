@@ -1030,6 +1030,215 @@ export function sidebarTargetLabel(
     : (target.alias ?? shortSessionID(target.sessionID));
 }
 
+// Marquee scrolling for overflowing subagent titles, mirroring the host's
+// session-tab behavior: hover a row whose label overflows the laid-out label
+// column and the title scrolls exactly one `label + " · "` cycle, then rests
+// on the truncated label until the pointer leaves.
+const MARQUEE_GAP = ' · ';
+const MARQUEE_DELAY_MS = 600;
+const MARQUEE_INTERVAL_MS = 80;
+
+let graphemeSegmenter: Intl.Segmenter | undefined;
+
+function graphemes(value: string): string[] {
+  graphemeSegmenter ??= new Intl.Segmenter(undefined, {
+    granularity: 'grapheme',
+  });
+  return [...graphemeSegmenter.segment(value)].map((part) => part.segment);
+}
+
+export function marqueeOverflows(label: string, width: number): boolean {
+  return Bun.stringWidth(label) > width;
+}
+
+export function marqueeCycleWidth(label: string): number {
+  return Bun.stringWidth(label) + Bun.stringWidth(MARQUEE_GAP);
+}
+
+/** Grapheme prefix of `label` no wider than `width` columns. */
+function marqueePrefix(label: string, width: number): string {
+  let out = '';
+  let used = 0;
+  for (const grapheme of graphemes(label)) {
+    const next = used + Bun.stringWidth(grapheme);
+    if (next > width) break;
+    out += grapheme;
+    used = next;
+  }
+  return out;
+}
+
+/**
+ * The visible slice of a scrolling label: a `width`-column sliding window
+ * over the `label + " · "` cycle, offset by `offset` columns (one column per
+ * tick; wide graphemes hold their frame for the columns they span). An
+ * offset of 0 or a full cycle multiple yields the plain prefix.
+ */
+export function marqueeText(
+  label: string,
+  width: number,
+  offset: number,
+): string {
+  if (width <= 0) return '';
+  if (!marqueeOverflows(label, width) || offset <= 0) {
+    return marqueePrefix(label, width);
+  }
+  const cycle = [...graphemes(label), ...graphemes(MARQUEE_GAP)];
+  const cycleWidth = marqueeCycleWidth(label);
+  const cursor = ((offset % cycleWidth) + cycleWidth) % cycleWidth;
+  let start = 0;
+  let consumed = 0;
+  while (start < cycle.length && consumed < cursor) {
+    consumed += Bun.stringWidth(cycle[start]);
+    start += 1;
+  }
+  let out = '';
+  let used = 0;
+  for (let i = start; i < cycle.length * 2; i += 1) {
+    const grapheme = cycle[i % cycle.length];
+    const next = used + Bun.stringWidth(grapheme);
+    if (next > width) break;
+    out += grapheme;
+    used = next;
+  }
+  return out;
+}
+
+/** Scheduling seam: tests drive the marquee with the manual timer harness. */
+export interface MarqueeScheduler {
+  setTimeout: (callback: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+}
+
+const hostTimeScheduler: MarqueeScheduler = {
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (handle) =>
+    clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+type MarqueeEntry = {
+  label: string;
+  width: number;
+  scrolling: boolean;
+  offset: () => number;
+  setOffset: (next: number) => void;
+  delay?: unknown;
+  step?: unknown;
+};
+
+export interface SidebarMarquee {
+  /** Reactive label slice for a rendered row; `label` when not scrolling. */
+  slice: (sessionID: string, label: string) => string;
+  /** Hover entered: start scrolling when the label overflows `width`. */
+  enter: (sessionID: string, label: string, width: number) => void;
+  /** Hover left: stop scrolling and restore the truncated label. */
+  leave: (sessionID: string) => void;
+  /** Drop entries for rows that disappeared from the sidebar. */
+  retain: (sessionIDs: ReadonlySet<string>) => void;
+}
+
+/**
+ * Marquee state holder. Lives outside the sidebar tree on purpose: the
+ * sidebar re-renders every refresh tick, while scroll offsets and timers
+ * must survive; OpenTUI re-synthesizes over/out after tree changes, so
+ * hover state is not lost either.
+ */
+export function createSidebarMarquee(
+  scheduler: MarqueeScheduler = hostTimeScheduler,
+): SidebarMarquee {
+  const entries = new Map<string, MarqueeEntry>();
+
+  const clearTimers = (entry: MarqueeEntry): void => {
+    if (entry.delay !== undefined) scheduler.clearTimeout(entry.delay);
+    if (entry.step !== undefined) scheduler.clearTimeout(entry.step);
+    entry.delay = undefined;
+    entry.step = undefined;
+  };
+
+  // The per-tick step is a self-rescheduling timeout: one seam type covers
+  // both the initial delay and the scroll cadence.
+  const scheduleStep = (entry: MarqueeEntry): void => {
+    entry.step = scheduler.setTimeout(() => {
+      entry.step = undefined;
+      const cycleWidth = marqueeCycleWidth(entry.label);
+      const next = entry.offset() + 1;
+      entry.setOffset(next < cycleWidth ? next : 0);
+      if (next < cycleWidth) scheduleStep(entry);
+    }, MARQUEE_INTERVAL_MS);
+  };
+
+  const entryFor = (sessionID: string): MarqueeEntry => {
+    let entry = entries.get(sessionID);
+    if (entry === undefined) {
+      const [offset, setSignal] = createSignal(0);
+      entry = {
+        label: '',
+        width: 0,
+        scrolling: false,
+        offset,
+        setOffset: (next) => setSignal(next),
+      };
+      entries.set(sessionID, entry);
+    }
+    return entry;
+  };
+
+  return {
+    slice(sessionID, label) {
+      const entry = entryFor(sessionID);
+      // Read the offset signal unconditionally: a short-circuit on the
+      // plain `scrolling` flag would leave reactive consumers (the label
+      // child memo) with no subscription and they would never repaint.
+      const offset = entry.offset();
+      return entry.scrolling && offset > 0
+        ? marqueeText(label, entry.width, offset)
+        : label;
+    },
+    enter(sessionID, label, width) {
+      if (width <= 0 || !marqueeOverflows(label, width)) return;
+      const entry = entryFor(sessionID);
+      entry.label = label;
+      entry.width = width;
+      // Already scrolling (pointer moved between the row's children): keep
+      // the current pass instead of restarting the delay.
+      if (entry.scrolling) return;
+      entry.scrolling = true;
+      clearTimers(entry);
+      entry.setOffset(0);
+      entry.delay = scheduler.setTimeout(() => {
+        entry.delay = undefined;
+        entry.setOffset(1);
+        scheduleStep(entry);
+      }, MARQUEE_DELAY_MS);
+    },
+    leave(sessionID) {
+      const entry = entries.get(sessionID);
+      if (entry === undefined) return;
+      clearTimers(entry);
+      entry.scrolling = false;
+      entry.setOffset(0);
+    },
+    retain(sessionIDs) {
+      for (const [sessionID, entry] of entries) {
+        if (sessionIDs.has(sessionID)) continue;
+        clearTimers(entry);
+        entries.delete(sessionID);
+      }
+    },
+  };
+}
+
+let sidebarMarquee = createSidebarMarquee();
+
+/** Test seam: drive the module marquee with a harness clock, or restore it. */
+export function setSidebarMarqueeSchedulerForTests(
+  scheduler?: MarqueeScheduler,
+): void {
+  sidebarMarquee = createSidebarMarquee(
+    scheduler === undefined ? hostTimeScheduler : scheduler,
+  );
+}
+
 /**
  * Per-window sidebar interaction state. `navigate` is feature-detected at
  * startup: without it the sidebar renders informatively (no handlers).
@@ -1280,6 +1489,8 @@ function decorateInteractiveRow(
     hasSelectedText?: () => boolean;
     /** Skip hover painting (e.g. static headers) while keeping activation. */
     paintHover?: boolean;
+    /** Notified on hover enter and (post-guard) leave, paint or not. */
+    onHoverChange?: (hovered: boolean) => void;
   },
 ): JSX.Element {
   const row = node as unknown as HoverRowRenderable;
@@ -1299,16 +1510,18 @@ function decorateInteractiveRow(
     }
   };
 
-  if (opts.paintHover !== false) {
+  if (opts.paintHover !== false || opts.onHoverChange !== undefined) {
     setProp(node as never, 'onMouseOver', () => {
-      applyHover(true);
+      if (opts.paintHover !== false) applyHover(true);
+      opts.onHoverChange?.(true);
     });
     setProp(
       node as never,
       'onMouseOut',
       (event?: { x?: number; y?: number }) => {
         if (isPointerInsideRow(row, event)) return;
-        applyHover(false);
+        if (opts.paintHover !== false) applyHover(false);
+        opts.onHoverChange?.(false);
       },
     );
   }
@@ -1519,7 +1732,9 @@ function compactAgentRow(options: AgentRowOptions): JSX.Element {
 /**
  * One expanded subagent destination: a fixed-width status indicator and a
  * label (session title when known, else alias / short id).
- * Hover mutates this box in place so the click target survives ticks.
+ * Hover mutates this box in place so the click target survives ticks; an
+ * overflowing label marquees across the laid-out label column (state lives
+ * in the module-level marquee, outside the rebuilt tree).
  */
 function sessionTargetRow(
   target: SidebarSessionTarget,
@@ -1540,6 +1755,19 @@ function sessionTargetRow(
       : target.status === 'retry'
         ? (theme.warning ?? STATUS_RETRY_COLOR)
         : (theme.success ?? STATUS_ACTIVE_COLOR);
+  // Hoisted so the hover handler can read the label column's laid-out width.
+  const labelEl = text(
+    {
+      fg: theme.textMuted,
+      flexShrink: 1,
+      wrapMode: 'none',
+      truncate: true,
+    },
+    // Reactive slice: while this row's marquee is scrolling the window
+    // slides across the label; otherwise the full label renders and the
+    // native truncate keeps the ellipsis.
+    [() => sidebarMarquee.slice(target.sessionID, label)],
+  );
   const row = box(
     {
       width: '100%',
@@ -1563,15 +1791,7 @@ function sessionTargetRow(
               : () => `${getSidebarActivityIndicator(now())} `,
         ],
       ),
-      text(
-        {
-          fg: theme.textMuted,
-          flexShrink: 1,
-          wrapMode: 'none',
-          truncate: true,
-        },
-        [label],
-      ),
+      labelEl,
       ...(annotation !== undefined
         ? [
             text(
@@ -1590,6 +1810,18 @@ function sessionTargetRow(
     hoverBackground,
     onActivate,
     hasSelectedText,
+    onHoverChange: (hovered) => {
+      if (!hovered) {
+        sidebarMarquee.leave(target.sessionID);
+        return;
+      }
+      // Overflow is judged against the laid-out label column; without
+      // geometry the row keeps its truncated label.
+      const width = (labelEl as { width?: unknown }).width;
+      if (typeof width === 'number' && width > 0) {
+        sidebarMarquee.enter(target.sessionID, label, Math.floor(width));
+      }
+    },
   });
 }
 
@@ -1858,7 +2090,8 @@ export function renderSidebar(
     hasSelectedText: interaction?.hasSelectedText,
     paintHover: false,
   });
-  return box(
+  const marqueeSessionIDs = new Set<string>();
+  const sidebarTree = box(
     {
       width: '100%',
       flexDirection: 'column',
@@ -1950,6 +2183,9 @@ export function renderSidebar(
               ? compactAgentRow(rowOptions)
               : agentRow(rowOptions);
             if (!expanded) return [agentRowEl];
+            for (const target of allTargets) {
+              marqueeSessionIDs.add(target.sessionID);
+            }
             return [
               agentRowEl,
               ...allTargets.map((target) =>
@@ -1968,6 +2204,10 @@ export function renderSidebar(
         : []),
     ],
   );
+  // Marquee state (offsets, timers) lives outside the rebuilt tree; drop
+  // entries for rows that disappeared from this render.
+  sidebarMarquee.retain(marqueeSessionIDs);
+  return sidebarTree;
 }
 
 function buildConfigStatusRow(

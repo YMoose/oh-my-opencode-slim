@@ -14,6 +14,7 @@ import {
   compareAliasNumeric,
   createSerializedRefresh,
   createSidebarInteraction,
+  createSidebarMarquee,
   fetchRemoteAgentRegistry,
   getActiveSidebarAgentNames,
   getContrastForeground,
@@ -25,6 +26,9 @@ import {
   hydrateRemoteModels,
   isRefreshCurrent,
   makeRouteNavigator,
+  marqueeCycleWidth,
+  marqueeOverflows,
+  marqueeText,
   overlaySelectedRootModel,
   paneWiringOptions,
   readConfigState,
@@ -37,6 +41,7 @@ import {
   STATUS_DOT_GLYPH,
   STATUS_STOPPED_GLYPH,
   selectionGuard,
+  setSidebarMarqueeSchedulerForTests,
   shortSessionID,
   sidebarSiblingAnnotation,
   sidebarTargetLabel,
@@ -4039,6 +4044,291 @@ describe('sidebarTargetLabel', () => {
     expect(
       sidebarTargetLabel({ sessionID: 'ses-b', alias: 'exp-4' }, () => ' \n '),
     ).toBe('exp-4');
+  });
+});
+
+describe('sidebar title marquee', () => {
+  afterEach(() => {
+    setSidebarMarqueeSchedulerForTests();
+  });
+
+  const harnessScheduler = (
+    harness: ReturnType<typeof createTimerHarness>,
+  ) => ({
+    setTimeout: (callback: () => void, ms: number) =>
+      harness.setTimeout(callback, ms),
+    clearTimeout: (handle: unknown) => harness.clearTimeout(handle as number),
+  });
+
+  // The scroll step is a self-rescheduling timeout, so a single clock jump
+  // only ever fires one step (the reschedule lands beyond the jumped now).
+  // Advance tick by tick instead — each step schedules the next at now+80.
+  const advanceTicks = async (
+    harness: ReturnType<typeof createTimerHarness>,
+    ticks: number,
+  ): Promise<void> => {
+    for (let i = 0; i < ticks; i += 1) await harness.advance(80);
+  };
+
+  test('marqueeOverflows judges by display width, not code units', () => {
+    expect(marqueeOverflows('Exact fit', 9)).toBe(false);
+    expect(marqueeOverflows('Exact fit', 8)).toBe(true);
+    expect(marqueeOverflows('会话', 4)).toBe(false);
+    expect(marqueeOverflows('会话', 3)).toBe(true);
+  });
+
+  test('marqueeText slides one column per offset over the label+gap cycle', () => {
+    const title = 'A long session title';
+    expect(marqueeText(title, 8, 0)).toBe('A long s');
+    expect(marqueeText(title, 8, 2)).toBe('long ses');
+    expect(marqueeText(title, 8, 15)).toBe('title · ');
+    expect(marqueeText(title, 8, 20)).toBe(' · A lon');
+    // A full cycle (and any rest offset) lands back on the plain prefix.
+    expect(marqueeText(title, 8, marqueeCycleWidth(title))).toBe('A long s');
+    expect(marqueeText(title, 8, -4)).toBe('A long s');
+    // A cycle multiple over a shorter title also resets to the prefix.
+    expect(marqueeText('abcde', 3, marqueeCycleWidth('abcde') * 2)).toBe('abc');
+    // Width guarded: no window, no output.
+    expect(marqueeText(title, 0, 4)).toBe('');
+  });
+
+  test('wide graphemes move as whole units and hold their frame', () => {
+    // Each CJK glyph spans two columns, so single-column offsets repeat.
+    expect(marqueeText('会话标题', 4, 1)).toBe('话标');
+    expect(marqueeText('会话标题', 4, 2)).toBe('话标');
+    expect(marqueeText('会话标题', 4, 4)).toBe('标题');
+    expect(marqueeText('会话标题', 4, 5)).toBe('题 ·');
+    // Emoji and regional-indicator pairs stay single graphemes.
+    expect(marqueeText('a🧭b', 2, 1)).toBe('🧭');
+    expect(marqueeText('a🧭b', 2, 2)).toBe('b ');
+    expect(marqueeText('🇺🇸xy', 3, 3)).toBe('y ·');
+  });
+
+  test('a fitting label never scrolls and renders whole', () => {
+    expect(marqueeText('abc', 5, 3)).toBe('abc');
+  });
+
+  test('controller holds the delay, advances per tick, rests after one cycle', async () => {
+    const harness = createTimerHarness();
+    const marquee = createSidebarMarquee(harnessScheduler(harness));
+    const label = 'abcdefgh'; // width 8, cycle 8 + 3 = 11
+
+    // No entry yet: the slice is the plain label.
+    expect(marquee.slice('s1', label)).toBe(label);
+    marquee.enter('s1', label, 4);
+    expect(harness.pending()).toBe(1);
+    // During the 600ms delay the truncated label stays.
+    await harness.advance(599);
+    expect(marquee.slice('s1', label)).toBe(label);
+    await harness.advance(1);
+    expect(marquee.slice('s1', label)).toBe('bcde');
+    await harness.advance(80);
+    expect(marquee.slice('s1', label)).toBe('cdef');
+    // Run past the end of the cycle: it rests at the prefix with no timers.
+    await advanceTicks(harness, 11);
+    expect(marquee.slice('s1', label)).toBe(label);
+    expect(harness.pending()).toBe(0);
+  });
+
+  test('controller leave resets, fitting labels never start, re-enter continues', async () => {
+    const harness = createTimerHarness();
+    const marquee = createSidebarMarquee(harnessScheduler(harness));
+    const label = 'abcdefgh';
+
+    // Leave mid-scroll restores the label and clears every timer.
+    marquee.enter('s1', label, 4);
+    await harness.advance(600);
+    expect(marquee.slice('s1', label)).toBe('bcde');
+    marquee.leave('s1');
+    expect(marquee.slice('s1', label)).toBe(label);
+    expect(harness.pending()).toBe(0);
+
+    // A label that fits its column schedules nothing.
+    marquee.enter('s2', 'ab', 10);
+    expect(harness.pending()).toBe(0);
+    expect(marquee.slice('s2', 'ab')).toBe('ab');
+    marquee.enter('s3', 'wide label', 0);
+    expect(harness.pending()).toBe(0);
+
+    // Re-entering mid-pass (pointer crossing row children) keeps the pass.
+    marquee.enter('s4', label, 4);
+    await harness.advance(600);
+    await harness.advance(80);
+    expect(marquee.slice('s4', label)).toBe('cdef');
+    marquee.enter('s4', label, 4);
+    await harness.advance(80);
+    expect(marquee.slice('s4', label)).toBe('defg');
+  });
+
+  test('controller retain sweeps disappeared rows and their timers', async () => {
+    const harness = createTimerHarness();
+    const marquee = createSidebarMarquee(harnessScheduler(harness));
+    const label = 'abcdefgh';
+
+    marquee.enter('s1', label, 4);
+    await harness.advance(600);
+    expect(harness.pending()).toBe(1);
+    marquee.retain(new Set(['s2']));
+    expect(harness.pending()).toBe(0);
+    // The swept id starts fresh when the row reappears.
+    marquee.enter('s1', label, 4);
+    await harness.advance(600);
+    expect(marquee.slice('s1', label)).toBe('bcde');
+  });
+
+  test('hovering an overflowing subagent row marquees its title', async () => {
+    const harness = createTimerHarness();
+    setSidebarMarqueeSchedulerForTests(harnessScheduler(harness));
+    const longTitle = 'Investigate the flaky retry pipeline in depth';
+    const snapshot = createSnapshot({
+      agentModels: { explorer: 'openai/gpt-6' },
+      activeSessions: { exp_a: 'explorer', exp_b: 'explorer' },
+      sessionParents: { exp_a: 'conv-1', exp_b: 'conv-1' },
+      sessionDetails: {
+        exp_a: { alias: 'exp-1', status: 'busy' },
+        exp_b: { alias: 'exp-2', status: 'busy' },
+      },
+    });
+    const theme = {
+      accent: '#22c55e',
+      background: '#111111',
+      borderActive: '#555555',
+      text: '#ffffff',
+      textMuted: '#aaaaaa',
+      success: '#22c55e',
+      warning: '#f59e0b',
+    };
+    const interaction = {
+      navigate: () => {},
+      isOpen: () => true,
+      toggleOpen: () => {},
+      expandedAgents: () => new Set(['explorer']),
+      toggleAgent: () => {},
+      syncScope: () => {},
+    };
+    const resolveSessionTitle = (sessionID: string): string | undefined =>
+      sessionID === 'exp_a' ? longTitle : 'Short';
+
+    const setup = await testRender(
+      () =>
+        renderSidebar(
+          snapshot,
+          'test',
+          theme,
+          false,
+          false,
+          () => 0,
+          'conv-1',
+          interaction,
+          undefined,
+          undefined,
+          resolveSessionTitle,
+        ) as never,
+      { width: 40, height: 24 },
+    );
+    try {
+      await setup.renderOnce();
+      const rowLines = () => setup.captureCharFrame().split('\n');
+      const row = rowLines().findIndex((line) => line.includes('Investigate'));
+      expect(row).toBeGreaterThan(-1);
+      const labelCol = rowLines()[row].indexOf('Investigate');
+      expect(labelCol).toBeGreaterThan(-1);
+
+      // Hovering arms the delay; the truncated label stays meanwhile.
+      await setup.mockMouse.moveTo(labelCol + 4, row);
+      await setup.renderOnce();
+      expect(harness.pending()).toBe(1);
+      expect(rowLines()[row]).toContain('Investigate');
+
+      // After the delay the window slides past the first column.
+      await harness.advance(600);
+      await setup.renderOnce();
+      const scrolled = rowLines()[row];
+      expect(scrolled).not.toContain('Investigate');
+      // Next tick the window advanced another column.
+      await advanceTicks(harness, 1);
+      await setup.renderOnce();
+      expect(rowLines()[row]).not.toBe(scrolled);
+      // Deep in the cycle the " · " gap scrolls through the window.
+      await advanceTicks(harness, 30);
+      await setup.renderOnce();
+      expect(rowLines()[row]).toContain('·');
+
+      // Leaving the row restores the truncated label and clears timers.
+      await setup.mockMouse.moveTo(0, 0);
+      await setup.renderOnce();
+      expect(rowLines()[row]).toContain('Investigate');
+      expect(harness.pending()).toBe(0);
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test('hovering a fitting subagent row never schedules a marquee', async () => {
+    const harness = createTimerHarness();
+    setSidebarMarqueeSchedulerForTests(harnessScheduler(harness));
+    const snapshot = createSnapshot({
+      agentModels: { explorer: 'openai/gpt-6' },
+      activeSessions: { exp_a: 'explorer', exp_b: 'explorer' },
+      sessionParents: { exp_a: 'conv-1', exp_b: 'conv-1' },
+      sessionDetails: {
+        exp_a: { alias: 'exp-1', status: 'busy' },
+        exp_b: { alias: 'exp-2', status: 'busy' },
+      },
+    });
+    const theme = {
+      accent: '#22c55e',
+      background: '#111111',
+      borderActive: '#555555',
+      text: '#ffffff',
+      textMuted: '#aaaaaa',
+      success: '#22c55e',
+      warning: '#f59e0b',
+    };
+    const interaction = {
+      navigate: () => {},
+      isOpen: () => true,
+      toggleOpen: () => {},
+      expandedAgents: () => new Set(['explorer']),
+      toggleAgent: () => {},
+      syncScope: () => {},
+    };
+
+    const setup = await testRender(
+      () =>
+        renderSidebar(
+          snapshot,
+          'test',
+          theme,
+          false,
+          false,
+          () => 0,
+          'conv-1',
+          interaction,
+          undefined,
+          undefined,
+          () => 'Short title',
+        ) as never,
+      { width: 40, height: 24 },
+    );
+    try {
+      await setup.renderOnce();
+      const rowLines = () => setup.captureCharFrame().split('\n');
+      const row = rowLines().findIndex((line) => line.includes('Short title'));
+      expect(row).toBeGreaterThan(-1);
+      const before = rowLines()[row];
+      const col = before.indexOf('Short title');
+
+      await setup.mockMouse.moveTo(col + 2, row);
+      await setup.renderOnce();
+      expect(harness.pending()).toBe(0);
+      await harness.advance(600);
+      await advanceTicks(harness, 2);
+      await setup.renderOnce();
+      expect(rowLines()[row]).toBe(before);
+    } finally {
+      setup.renderer.destroy();
+    }
   });
 });
 
